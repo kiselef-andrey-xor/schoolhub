@@ -1,0 +1,143 @@
+# ЗЕРКАЛЬНАЯ КОПИЯ корневого docker-compose.yml (редакция 13.10.2026).
+# Правки вносите в корневой файл, затем копируйте сюда; в мастере Container
+# Manager всегда выбирайте корневой docker-compose.yml.
+
+# ============================================================================
+#  SchoolHub для Synology NAS — редакция от 13.10.2026, «без лишних шагов»
+#
+#  Что исправлено по итогам предыдущих установок:
+#    • пути сборки АБСОЛЮТНЫЕ (/volume2/docker/schoolhub/app/...) —
+#      ошибка «unable to prepare context: path "../../backend" not found» исключена;
+#    • НОВЫЕ имена томов (db_v2 / uploads_v2 / secrets_v2) — старые тома с
+#      «чужим» паролем БД и битыми правами из прежних попыток не задействуются;
+#    • SECRET_KEY задан явно — нет предупреждения «Permission denied:
+#      /data/secrets/secret_key», сессии не слетают при перезапуске контейнеров;
+#    • Владелец создаётся АВТОМАТИЧЕСКИ при первом старте — страница
+#      «Первоначальная настройка» и код настройки НЕ появляются:
+#      сайт сразу показывает форму входа.
+#
+#  Учётные данные Владельца по умолчанию (смените пароль после входа):
+#      e-mail:   admin@schoolhub.local
+#      пароль:   Nas#School-2026!
+#  Свои данные: правьте ОДНУ строку `command:` у сервиса backend ниже
+#  (--email / --password / --name / --school) ДО первой сборки.
+#
+#  Запуск: Container Manager → Проект → Создать →
+#          путь /docker/schoolhub/app, файл docker-compose.yml (этот).
+# ============================================================================
+
+name: schoolhub
+
+services:
+  db:
+    image: postgres:16-alpine                 # мультиарх: есть linux/arm64
+    container_name: schoolhub-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: schoolhub
+      POSTGRES_USER: schoolhub
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-schoolhub}   # БД доступна только внутри сети контейнеров
+      TZ: ${TZ:-Europe/Moscow}
+    command:
+      - postgres
+      - -c
+      - shared_buffers=128MB                  # экономим память NAS
+      - -c
+      - max_connections=40
+      - -c
+      - log_min_duration_statement=1000
+    volumes:
+      - db_v2:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U schoolhub -d schoolhub"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 420M
+    networks: [schoolhub]
+
+  backend:
+    build:
+      context: /volume2/docker/schoolhub/app/backend
+    image: schoolhub-backend:local
+    container_name: schoolhub-backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      APP_ENV: prod
+      DATABASE_URL: postgresql+asyncpg://schoolhub:${POSTGRES_PASSWORD:-schoolhub}@db:5432/schoolhub
+      # ключ подписи сессий: задан явно, переживает любые перезапуски
+      SECRET_KEY: "DcLRktTQsIwm0DZd5gz1X0SVv7NppeytYekAXdtu4l1gOMlq27pnit6n931HQm5Z"
+      SECRET_KEY_FILE: /data/secrets/secret_key
+      ACCESS_TOKEN_TTL_MIN: ${ACCESS_TOKEN_TTL_MIN:-30}
+      REFRESH_TOKEN_TTL_DAYS: ${REFRESH_TOKEN_TTL_DAYS:-14}
+      # auto = Secure-cookie при входе по HTTPS (DSM-прокси пробрасывает X-Forwarded-Proto)
+      COOKIE_SECURE: ${COOKIE_SECURE:-auto}
+      AUTO_MIGRATE: ${AUTO_MIGRATE:-true}
+      UPLOAD_DIR: /data/uploads
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-25}
+      TRUST_PROXY_HEADERS: "true"
+      TZ: ${TZ:-Europe/Moscow}
+      LDAP_ENABLED: ${LDAP_ENABLED:-false}   # домен (Active Directory) выключен
+      AUTO_SEED: ${AUTO_SEED:-false}         # демо-данные не нужны
+    volumes:
+      - uploads_v2:/data/uploads
+      - secrets_v2:/data/secrets
+    expose:
+      - "8000"                                # внутри сети контейнеров, наружу не виден
+    # сперва идемпотентно создаёт Владельца (и схему БД), затем поднимает API;
+    # если Владелец уже есть — скрипт ничего не меняет и молча завершается
+    command: >
+      sh -c "python -m scripts.first_owner --email admin@schoolhub.local --password 'Nas#School-2026!' --name 'Администратор' --school 'Школа' || true;
+      uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1 --proxy-headers"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health',timeout=5).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 45s
+    deploy:
+      resources:
+        limits:
+          memory: 460M
+    networks: [schoolhub]
+
+  frontend:
+    build:
+      context: /volume2/docker/schoolhub/app/frontend
+      target: prod                            # nginx + готовая статика
+      args:
+        VITE_API_URL: /api/v1
+    image: schoolhub-frontend:local
+    container_name: schoolhub-frontend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      BACKEND_HOST: backend
+      BACKEND_PORT: "8000"
+      MAX_UPLOAD_SIZE: ${MAX_UPLOAD_SIZE:-30m}
+      TZ: ${TZ:-Europe/Moscow}
+    ports:
+      - "${HTTP_PORT:-8080}:80"               # ← единственный порт, который видно в сети
+    deploy:
+      resources:
+        limits:
+          memory: 96M
+    networks: [schoolhub]
+
+networks:
+  schoolhub:
+    driver: bridge
+
+volumes:
+  db_v2:
+  uploads_v2:
+  secrets_v2:
